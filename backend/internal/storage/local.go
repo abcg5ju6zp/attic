@@ -58,24 +58,34 @@ func (s *LocalStorage) Upload(ctx context.Context, filename string, contentType 
 	// Create a unique key like S3 does: uuid/filename
 	key := fmt.Sprintf("%s/%s", uuid.New().String(), filename)
 
+	if err := s.UploadWithKey(ctx, key, contentType, body); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// UploadWithKey stores a file under an explicit key. Retrying with the same
+// key truncates and overwrites the existing file instead of creating a second
+// object.
+func (s *LocalStorage) UploadWithKey(ctx context.Context, key string, contentType string, body io.Reader) error {
 	// Create the full path
 	fullPath := filepath.Join(s.basePath, key)
 
 	// Create parent directory if needed
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("creating directory: %w", err)
+		return fmt.Errorf("creating directory: %w", err)
 	}
 
 	// Chown the directory if PUID/PGID are configured
 	if err := s.chown(dir); err != nil {
-		return "", fmt.Errorf("setting directory ownership: %w", err)
+		return fmt.Errorf("setting directory ownership: %w", err)
 	}
 
-	// Create the file
+	// Create the file (os.Create truncates, so a retry overwrites the object)
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return "", fmt.Errorf("creating file: %w", err)
+		return fmt.Errorf("creating file: %w", err)
 	}
 	defer file.Close()
 
@@ -83,17 +93,17 @@ func (s *LocalStorage) Upload(ctx context.Context, filename string, contentType 
 	if _, err := io.Copy(file, body); err != nil {
 		// Clean up on failure
 		os.Remove(fullPath)
-		return "", fmt.Errorf("writing file: %w", err)
+		return fmt.Errorf("writing file: %w", err)
 	}
 
 	// Chown the file if PUID/PGID are configured
 	if err := s.chown(fullPath); err != nil {
 		// Clean up on failure
 		os.Remove(fullPath)
-		return "", fmt.Errorf("setting file ownership: %w", err)
+		return fmt.Errorf("setting file ownership: %w", err)
 	}
 
-	return key, nil
+	return nil
 }
 
 // GetPresignedURL returns a URL for accessing the file

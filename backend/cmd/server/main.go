@@ -145,6 +145,11 @@ func main() {
 	}
 	defaultOrgID := defaultOrg.ID
 
+	// Recoverable attachment upload publisher. Storage may be nil when
+	// misconfigured; uploads then return 503, but database-driven recovery of
+	// publishes that already passed the object stage still works.
+	attachmentPublisher := repository.NewAttachmentPublisher(db.Pool, fileStorage)
+
 	// Bootstrap admin user if needed
 	if err := bootstrapAdmin(ctx, userRepo, cfg, defaultOrgID); err != nil {
 		slog.Error("failed to bootstrap admin", "error", err)
@@ -219,6 +224,12 @@ func main() {
 
 	// Initialize handlers
 	h := handler.New(db, repos, fileStorage, defaultOrgID)
+	h.SetAttachmentPublisher(attachmentPublisher)
+
+	// Resume attachment publishes interrupted by a previous process crash.
+	recoverCtx, stopRecovery := context.WithCancel(context.Background())
+	defer stopRecovery()
+	go attachmentPublisher.RunRecovery(recoverCtx, time.Minute)
 	pluginHandler := handler.NewPluginHandler(pluginRegistry, repos, fileStorage, defaultOrgID)
 	if err := pluginHandler.InitializeEnabledPluginCategories(ctx); err != nil {
 		slog.Warn("one or more plugin categories could not be initialized", "error", err)
@@ -418,6 +429,7 @@ func main() {
 			// Attachments (nested under asset)
 			r.Get("/{id}/attachments", h.ListAttachments)
 			r.Post("/{id}/attachments", h.UploadAttachment)
+			r.Get("/{id}/attachments/uploads/{uploadId}", h.GetUploadStatus)
 
 			// Custom asset history events
 			r.Get("/{id}/events", h.ListAssetEvents)
@@ -484,6 +496,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	stopRecovery()
 	slog.Info("server stopped")
 }
 

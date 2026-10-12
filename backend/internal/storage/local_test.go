@@ -260,6 +260,40 @@ func Test_LocalStorage_Upload_PreservesContent(t *testing.T) {
 	}
 }
 
+func Test_LocalStorage_UploadWithKey_OverwritesSameObject(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, _ := NewLocalStorage(LocalConfig{
+		BasePath: tmpDir,
+		BaseURL:  "http://localhost:8080/files",
+	})
+
+	ctx := context.Background()
+	key := "uploads/fixed-id/file.txt"
+
+	if err := store.UploadWithKey(ctx, key, "text/plain", strings.NewReader("first")); err != nil {
+		t.Fatalf("first upload failed: %v", err)
+	}
+	if err := store.UploadWithKey(ctx, key, "text/plain", strings.NewReader("second-attempt")); err != nil {
+		t.Fatalf("retry upload failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, key))
+	if err != nil {
+		t.Fatalf("failed to read object: %v", err)
+	}
+	if string(data) != "second-attempt" {
+		t.Errorf("expected object to be overwritten at the same key, got %q", string(data))
+	}
+
+	entries, err := os.ReadDir(filepath.Join(tmpDir, "uploads", "fixed-id"))
+	if err != nil {
+		t.Fatalf("failed to list object dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected exactly one object, got %d", len(entries))
+	}
+}
+
 func Test_LocalStorage_ImplementsFileStorage(t *testing.T) {
 	// Compile-time check that LocalStorage implements FileStorage
 	var _ FileStorage = (*LocalStorage)(nil)

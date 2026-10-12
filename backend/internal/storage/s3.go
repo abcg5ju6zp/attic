@@ -70,6 +70,15 @@ func NewS3Client(ctx context.Context, cfg S3Config) (*S3Client, error) {
 func (c *S3Client) Upload(ctx context.Context, filename string, contentType string, body io.Reader) (string, error) {
 	key := fmt.Sprintf("%s/%s", uuid.New().String(), filename)
 
+	if err := c.UploadWithKey(ctx, key, contentType, body); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// UploadWithKey stores a file under an explicit key. S3 PutObject is an
+// idempotent overwrite, so retries with the same key never create duplicates.
+func (c *S3Client) UploadWithKey(ctx context.Context, key string, contentType string, body io.Reader) error {
 	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(c.bucket),
 		Key:         aws.String(key),
@@ -77,10 +86,9 @@ func (c *S3Client) Upload(ctx context.Context, filename string, contentType stri
 		ContentType: aws.String(contentType),
 	})
 	if err != nil {
-		return "", fmt.Errorf("uploading to S3: %w", err)
+		return fmt.Errorf("uploading to S3: %w", err)
 	}
-
-	return key, nil
+	return nil
 }
 
 // GetPresignedURL generates a presigned URL for downloading a file

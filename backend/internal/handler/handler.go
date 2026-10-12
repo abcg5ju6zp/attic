@@ -18,8 +18,18 @@ import (
 // FileStorage defines the interface for file storage backends
 type FileStorage interface {
 	Upload(ctx context.Context, filename string, contentType string, body io.Reader) (string, error)
+	UploadWithKey(ctx context.Context, key string, contentType string, body io.Reader) error
 	GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error)
 	Delete(ctx context.Context, key string) error
+}
+
+// AttachmentPublisher drives recoverable attachment upload publishes.
+type AttachmentPublisher interface {
+	Register(ctx context.Context, in repository.RegisterUploadInput) (*domain.AttachmentUpload, error)
+	PutObject(ctx context.Context, id uuid.UUID, body io.Reader) (*domain.AttachmentUpload, error)
+	Commit(ctx context.Context, id uuid.UUID) (*domain.AttachmentUpload, *domain.Attachment, error)
+	Get(ctx context.Context, id uuid.UUID) (*domain.AttachmentUpload, error)
+	AbortAttachment(ctx context.Context, attachmentID uuid.UUID) (assetID uuid.UUID, fileKey string, err error)
 }
 
 // Repositories holds all repository implementations
@@ -41,10 +51,11 @@ type Repositories struct {
 
 // Handler holds dependencies for HTTP handlers
 type Handler struct {
-	db      *database.DB
-	repos   *Repositories
-	storage FileStorage
-	orgID   uuid.UUID // Default organization ID
+	db        *database.DB
+	repos     *Repositories
+	storage   FileStorage
+	publisher AttachmentPublisher
+	orgID     uuid.UUID // Default organization ID
 }
 
 // New creates a new Handler
@@ -55,6 +66,12 @@ func New(db *database.DB, repos *Repositories, storage FileStorage, defaultOrgID
 		storage: storage,
 		orgID:   defaultOrgID,
 	}
+}
+
+// SetAttachmentPublisher wires the recoverable upload publisher. It must be
+// configured for attachment upload/deletion endpoints to be available.
+func (h *Handler) SetAttachmentPublisher(p AttachmentPublisher) {
+	h.publisher = p
 }
 
 // Health returns server health status
