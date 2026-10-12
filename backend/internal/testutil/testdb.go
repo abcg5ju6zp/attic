@@ -79,6 +79,8 @@ func (t *TestDB) TruncateAll(ctx context.Context) error {
 		"asset_events",
 		"asset_collections",
 		"collections",
+		"asset_deletion_objects",
+		"asset_deletions",
 		"attachments",
 		"warranties",
 		"asset_tags",

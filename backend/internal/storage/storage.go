@@ -17,4 +17,9 @@ type FileStorage interface {
 
 	// Delete removes a file from storage
 	Delete(ctx context.Context, key string) error
+
+	// Exists reports whether an object currently exists in storage. Delete
+	// responses can be ambiguous (timeouts, network errors), so reclaim
+	// workflows verify the object's factual state instead of trusting them.
+	Exists(ctx context.Context, key string) (bool, error)
 }

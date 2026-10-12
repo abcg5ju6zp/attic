@@ -634,6 +634,18 @@ func (h *Handler) DeleteAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.deletions != nil {
+		// found=false is deterministic for a missing asset and keeps the
+		// historical 204 behavior; object reclamation runs from the frozen
+		// manifest and retries independently of this response.
+		if _, err := h.deletions.DeleteAsset(r.Context(), id); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete asset")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if err := h.repos.Assets.Delete(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete asset")
 		return

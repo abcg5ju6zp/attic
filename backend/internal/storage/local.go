@@ -128,6 +128,19 @@ func (s *LocalStorage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Exists reports whether the file is currently present on disk. A missing
+// file reports (false, nil); other stat errors are returned.
+func (s *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
+	fullPath := filepath.Join(s.basePath, key)
+	if _, err := os.Stat(fullPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking file: %w", err)
+	}
+	return true, nil
+}
+
 // BasePath returns the base storage path (useful for serving files)
 func (s *LocalStorage) BasePath() string {
 	return s.basePath

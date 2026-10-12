@@ -555,14 +555,21 @@ func (r *AssetRepository) GetTotalValue(ctx context.Context, orgID uuid.UUID, fi
 	return total, err
 }
 
-func (r *AssetRepository) SetMainAttachment(ctx context.Context, assetID uuid.UUID, attachmentID *uuid.UUID) error {
+// SetMainAttachment assigns the main image on a live asset. The conditional
+// update serializes against asset deletion through the asset row lock; when
+// the asset was hidden first it reports updated=false instead of reviving an
+// old-generation relationship.
+func (r *AssetRepository) SetMainAttachment(ctx context.Context, assetID uuid.UUID, attachmentID *uuid.UUID) (bool, error) {
 	query := `
 		UPDATE assets
 		SET main_attachment_id = $2
 		WHERE id = $1 AND deleted_at IS NULL
 	`
-	_, err := r.pool.Exec(ctx, query, assetID, attachmentID)
-	return err
+	tag, err := r.pool.Exec(ctx, query, assetID, attachmentID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (r *AssetRepository) GetMainAttachmentID(ctx context.Context, assetID uuid.UUID) (*uuid.UUID, error) {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 )
 
@@ -108,4 +110,25 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("deleting from S3: %w", err)
 	}
 	return nil
+}
+
+// Exists checks object existence with HeadObject. S3 DeleteObject can return
+// success without the caller being sure the object is gone (or fail after the
+// server actually deleted it), so reclaim uses this to establish the facts.
+func (c *S3Client) Exists(ctx context.Context, key string) (bool, error) {
+	_, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return true, nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey":
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("checking object in S3: %w", err)
 }

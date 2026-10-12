@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/lmmendes/attic/internal/database"
+	"github.com/lmmendes/attic/internal/deletion"
 	"github.com/lmmendes/attic/internal/domain"
 	"github.com/lmmendes/attic/internal/repository"
 )
@@ -20,6 +21,7 @@ type FileStorage interface {
 	Upload(ctx context.Context, filename string, contentType string, body io.Reader) (string, error)
 	GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error)
 	Delete(ctx context.Context, key string) error
+	Exists(ctx context.Context, key string) (bool, error)
 }
 
 // Repositories holds all repository implementations
@@ -41,10 +43,11 @@ type Repositories struct {
 
 // Handler holds dependencies for HTTP handlers
 type Handler struct {
-	db      *database.DB
-	repos   *Repositories
-	storage FileStorage
-	orgID   uuid.UUID // Default organization ID
+	db        *database.DB
+	repos     *Repositories
+	storage   FileStorage
+	deletions *deletion.Service
+	orgID     uuid.UUID // Default organization ID
 }
 
 // New creates a new Handler
@@ -55,6 +58,12 @@ func New(db *database.DB, repos *Repositories, storage FileStorage, defaultOrgID
 		storage: storage,
 		orgID:   defaultOrgID,
 	}
+}
+
+// SetDeletionService wires reference-aware asset deletion and attachment
+// reclamation. When unset, handlers fall back to their legacy direct paths.
+func (h *Handler) SetDeletionService(svc *deletion.Service) {
+	h.deletions = svc
 }
 
 // Health returns server health status

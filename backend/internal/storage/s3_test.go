@@ -233,6 +233,32 @@ func Test_S3Client_Delete_Success(t *testing.T) {
 	}
 }
 
+func Test_S3Client_Exists(t *testing.T) {
+	ctx := context.Background()
+
+	exists, err := testS3Client.Exists(ctx, "non-existent-exists-key")
+	if err != nil || exists {
+		t.Fatalf("missing key: exists=%v err=%v", exists, err)
+	}
+
+	key, err := testS3Client.Upload(ctx, "exists-test.txt", "text/plain", strings.NewReader("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exists, err = testS3Client.Exists(ctx, key)
+	if err != nil || !exists {
+		t.Fatalf("uploaded key: exists=%v err=%v", exists, err)
+	}
+
+	if err := testS3Client.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	exists, err = testS3Client.Exists(ctx, key)
+	if err != nil || exists {
+		t.Fatalf("deleted key: exists=%v err=%v", exists, err)
+	}
+}
+
 func Test_S3Client_Delete_NonExistentKey_NoError(t *testing.T) {
 	ctx := context.Background()
 

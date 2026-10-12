@@ -167,6 +167,37 @@ func Test_LocalStorage_Delete_NonExistentKey_NoError(t *testing.T) {
 	}
 }
 
+func Test_LocalStorage_Exists(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, _ := NewLocalStorage(LocalConfig{
+		BasePath: tmpDir,
+		BaseURL:  "http://localhost:8080/files",
+	})
+	ctx := context.Background()
+
+	exists, err := s.Exists(ctx, "missing/file.txt")
+	if err != nil || exists {
+		t.Fatalf("missing key: exists=%v err=%v", exists, err)
+	}
+
+	key, err := s.Upload(ctx, "exists-test.txt", "text/plain", strings.NewReader("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exists, err = s.Exists(ctx, key)
+	if err != nil || !exists {
+		t.Fatalf("uploaded key: exists=%v err=%v", exists, err)
+	}
+
+	if err := s.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	exists, err = s.Exists(ctx, key)
+	if err != nil || exists {
+		t.Fatalf("deleted key: exists=%v err=%v", exists, err)
+	}
+}
+
 func Test_NewLocalStorage_CreatesDirectory(t *testing.T) {
 	tmpDir := t.TempDir()
 	storagePath := filepath.Join(tmpDir, "nested", "storage", "dir")

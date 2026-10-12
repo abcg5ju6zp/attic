@@ -122,6 +122,11 @@ func (m *mockStorage) GetPresignedURL(ctx context.Context, key string, duration 
 	return m.presignedURL, nil
 }
 
+func (m *mockStorage) Exists(ctx context.Context, key string) (bool, error) {
+	_, ok := m.files[key]
+	return ok, nil
+}
+
 // testAttachmentHandler wraps attachment logic for testing
 type testAttachmentHandler struct {
 	attachmentRepo *mockAttachmentRepo

@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/lmmendes/attic/internal/domain"
+	"github.com/lmmendes/attic/internal/repository"
 )
 
 const maxUploadSize = 50 * 1024 * 1024 // 50MB
@@ -113,6 +115,12 @@ func (h *Handler) UploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if err := h.repos.Attachments.Create(r.Context(), attachment); err != nil {
 		// Try to clean up the uploaded file
 		h.storage.Delete(r.Context(), key)
+		// The asset was hidden by a concurrent deletion generation: the new
+		// upload must not attach to that generation, report it deterministically.
+		if errors.Is(err, repository.ErrAssetNotLive) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to save attachment record")
 		return
 	}
@@ -179,10 +187,27 @@ func (h *Handler) DeleteAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.deletions != nil {
+		// Lifecycle commits first; the object is removed only when no live
+		// record references its key, and uncertain responses are verified.
+		found, err := h.deletions.DeleteAttachment(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete attachment")
+			return
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, "attachment not found")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Delete from S3
 	if h.storage != nil {
 		if err := h.storage.Delete(r.Context(), attachment.FileKey); err != nil {
 			// Log but continue - we still want to delete the DB record
+			slog.Warn("failed to delete attachment object", "error", err)
 		}
 	}
 
@@ -240,9 +265,16 @@ func (h *Handler) SetMainAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set as main attachment
-	if err := h.repos.Assets.SetMainAttachment(r.Context(), assetID, &attachmentID); err != nil {
+	// Set as main attachment. A zero-row update means the asset was hidden by
+	// a deletion generation in the meantime; an old relationship must not be
+	// revived on a deleted asset.
+	updated, err := h.repos.Assets.SetMainAttachment(r.Context(), assetID, &attachmentID)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to set main attachment")
+		return
+	}
+	if !updated {
+		writeError(w, http.StatusNotFound, "asset not found")
 		return
 	}
 
@@ -268,8 +300,13 @@ func (h *Handler) ClearMainAttachment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear main attachment
-	if err := h.repos.Assets.SetMainAttachment(r.Context(), assetID, nil); err != nil {
+	updated, err := h.repos.Assets.SetMainAttachment(r.Context(), assetID, nil)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to clear main attachment")
+		return
+	}
+	if !updated {
+		writeError(w, http.StatusNotFound, "asset not found")
 		return
 	}
 

@@ -20,6 +20,7 @@ import (
 	"github.com/lmmendes/attic/internal/auth"
 	"github.com/lmmendes/attic/internal/config"
 	"github.com/lmmendes/attic/internal/database"
+	"github.com/lmmendes/attic/internal/deletion"
 	"github.com/lmmendes/attic/internal/domain"
 	"github.com/lmmendes/attic/internal/handler"
 	"github.com/lmmendes/attic/internal/plugin"
@@ -219,6 +220,16 @@ func main() {
 
 	// Initialize handlers
 	h := handler.New(db, repos, fileStorage, defaultOrgID)
+
+	// Reference-aware asset deletion: continue frozen manifests from previous
+	// process lifetime, then reclaim unconfirmed objects in the background.
+	deletionRepo := repository.NewDeletionRepository(db.Pool)
+	deletionSvc := deletion.New(deletionRepo, repos.Attachments, fileStorage)
+	h.SetDeletionService(deletionSvc)
+	if err := deletionSvc.ResumeAll(ctx); err != nil {
+		slog.Warn("could not resume pending asset deletions", "error", err)
+	}
+	go deletionSvc.Run(ctx)
 	pluginHandler := handler.NewPluginHandler(pluginRegistry, repos, fileStorage, defaultOrgID)
 	if err := pluginHandler.InitializeEnabledPluginCategories(ctx); err != nil {
 		slog.Warn("one or more plugin categories could not be initialized", "error", err)
