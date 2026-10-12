@@ -565,6 +565,24 @@ func (r *AssetRepository) SetMainAttachment(ctx context.Context, assetID uuid.UU
 	return err
 }
 
+// SetMainAttachmentIfAbsent publishes an imported cover as the main image
+// without overwriting a main image the user (or a newer import generation)
+// chose later. It still wins when the slot is empty or already points at the
+// same attachment. Returns true when the update landed.
+func (r *AssetRepository) SetMainAttachmentIfAbsent(ctx context.Context, assetID, attachmentID uuid.UUID) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE assets
+		SET main_attachment_id = $2, updated_at = NOW()
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		  AND (main_attachment_id IS NULL OR main_attachment_id = $2)
+	`, assetID, attachmentID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (r *AssetRepository) GetMainAttachmentID(ctx context.Context, assetID uuid.UUID) (*uuid.UUID, error) {
 	query := `SELECT main_attachment_id FROM assets WHERE id = $1 AND deleted_at IS NULL`
 	var mainID *uuid.UUID

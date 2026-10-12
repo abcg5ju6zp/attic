@@ -1,6 +1,12 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // ImportPlugin defines the interface for all import plugins
 type ImportPlugin interface {
@@ -55,6 +61,48 @@ type ImportData struct {
 	ImageURL    *string        `json:"image_url,omitempty"`    // Primary image URL
 	Attributes  map[string]any `json:"attributes"`             // Attribute values (keyed by attribute key)
 	ExternalID  string         `json:"external_id"`            // External ID for source tracking
+}
+
+// ImportPublicationStatus tracks how far a single plugin import has progressed.
+type ImportPublicationStatus string
+
+const (
+	// ImportPublicationPending means the publication is incomplete and may be
+	// (re)claimed by any request with the same identity.
+	ImportPublicationPending ImportPublicationStatus = "pending"
+	// ImportPublicationPublishing means an owner currently holds the lease.
+	ImportPublicationPublishing ImportPublicationStatus = "publishing"
+	// ImportPublicationPublished means the asset and, when the source had one,
+	// its cover attachment/main image are complete.
+	ImportPublicationPublished ImportPublicationStatus = "published"
+)
+
+// ImportPublication is the durable, recoverable record of one plugin import.
+// The stable identity is (OrganizationID, PluginID, ExternalID). Each
+// delete-and-reimport bumps Generation so a stale recovery task can detect
+// that it no longer owns the result.
+type ImportPublication struct {
+	ID                uuid.UUID               `json:"id"`
+	OrganizationID    uuid.UUID               `json:"organization_id"`
+	PluginID          string                  `json:"plugin_id"`
+	ExternalID        string                  `json:"external_id"`
+	Generation        int                     `json:"generation"`
+	Status            ImportPublicationStatus `json:"status"`
+	AssetID           *uuid.UUID              `json:"asset_id,omitempty"`
+	Payload           json.RawMessage         `json:"payload"`
+	ExternalVersion   string                  `json:"external_version"`
+	CoverFileKey      *string                 `json:"cover_file_key,omitempty"`
+	CoverFileName     *string                 `json:"cover_file_name,omitempty"`
+	CoverContentType  *string                 `json:"cover_content_type,omitempty"`
+	CoverFileSize     *int64                  `json:"cover_file_size,omitempty"`
+	CoverAttachmentID *uuid.UUID              `json:"cover_attachment_id,omitempty"`
+	LeaseOwner        *uuid.UUID              `json:"lease_owner,omitempty"`
+	LeasedUntil       *time.Time              `json:"leased_until,omitempty"`
+	Attempts          int                     `json:"attempts"`
+	LastError         *string                 `json:"last_error,omitempty"`
+	CreatedAt         time.Time               `json:"created_at"`
+	UpdatedAt         time.Time               `json:"updated_at"`
+	PublishedAt       *time.Time              `json:"published_at,omitempty"`
 }
 
 // PluginInfo represents plugin metadata for API responses

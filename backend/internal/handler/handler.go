@@ -37,6 +37,7 @@ type Repositories struct {
 	Attributes    *repository.AttributeRepository
 	SavedFilters  *repository.SavedFilterRepository
 	Tags          *repository.TagRepository
+	Publications  *repository.ImportPublicationRepository
 }
 
 // Handler holds dependencies for HTTP handlers

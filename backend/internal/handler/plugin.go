@@ -1,21 +1,17 @@
 package handler
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lmmendes/attic/internal/domain"
 	"github.com/lmmendes/attic/internal/plugin"
 	"github.com/lmmendes/attic/internal/repository"
@@ -23,10 +19,11 @@ import (
 
 // PluginHandler handles plugin-related HTTP requests
 type PluginHandler struct {
-	registry *plugin.Registry
-	repos    *Repositories
-	storage  FileStorage
-	orgID    uuid.UUID
+	registry  *plugin.Registry
+	repos     *Repositories
+	storage   FileStorage
+	orgID     uuid.UUID
+	publisher *importPublisher
 }
 
 func namespacedPluginAttributes(pluginID string, attributes map[string]any) map[string]any {
@@ -66,12 +63,24 @@ type pluginAttributeRepository interface {
 
 // NewPluginHandler creates a new PluginHandler
 func NewPluginHandler(registry *plugin.Registry, repos *Repositories, storage FileStorage, defaultOrgID uuid.UUID) *PluginHandler {
-	return &PluginHandler{
+	h := &PluginHandler{
 		registry: registry,
 		repos:    repos,
 		storage:  storage,
 		orgID:    defaultOrgID,
 	}
+	if repos != nil && repos.Publications != nil && repos.Assets != nil && repos.Attachments != nil {
+		h.publisher = newImportPublisher(
+			defaultOrgID,
+			repos.Publications,
+			repos.Assets,
+			repos.Attachments,
+			repos.Categories,
+			repos.Attributes,
+			storage,
+		)
+	}
+	return h
 }
 
 func allFeaturesEnabled() *domain.OrganizationFeatures {
@@ -315,7 +324,8 @@ func (h *PluginHandler) Search(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SearchResponse{Results: results})
 }
 
-// Import fetches data from a plugin and creates an asset
+// Import fetches data from a plugin and publishes a single, recoverable
+// asset for the stable (organization, plugin, external id) identity.
 func (h *PluginHandler) Import(w http.ResponseWriter, r *http.Request) {
 	pluginID := chi.URLParam(r, "pluginId")
 
@@ -350,110 +360,107 @@ func (h *PluginHandler) Import(w http.ResponseWriter, r *http.Request) {
 		"plugin_id", pluginID,
 		"external_id", req.ExternalID)
 
-	// Fetch data from plugin
-	importData, err := p.Fetch(r.Context(), req.ExternalID)
-	if err != nil {
-		slog.Error("failed to fetch import data",
-			"plugin_id", pluginID,
-			"external_id", req.ExternalID,
-			"error", err)
-
-		// Check for context cancellation
+	// Fetch data from plugin. An uncertain fetch must not produce a duplicate:
+	// when the identity already exists the request resumes that publication
+	// from its pinned snapshot instead of failing.
+	fetched, fetchErr := p.Fetch(r.Context(), req.ExternalID)
+	if fetchErr != nil {
 		if r.Context().Err() != nil {
 			return
 		}
-
-		// Check for "not found" type errors
-		if strings.Contains(err.Error(), "not found") {
-			writeError(w, http.StatusNotFound, "item not found in external source")
+		existing, lookupErr := h.repos.Publications.GetByIdentity(r.Context(), h.orgID, pluginID, req.ExternalID)
+		if lookupErr != nil {
+			slog.Error("failed to look up existing import publication",
+				"plugin_id", pluginID, "external_id", req.ExternalID, "error", lookupErr)
+			writeError(w, http.StatusInternalServerError, "failed to resume import")
+			return
+		}
+		if existing != nil {
+			slog.Warn("external fetch uncertain; resuming existing import publication",
+				"plugin_id", pluginID, "external_id", req.ExternalID,
+				"generation", existing.Generation, "fetch_error", fetchErr)
+			h.publishImport(w, r, p, req.ExternalID, nil, features)
 			return
 		}
 
+		slog.Error("failed to fetch import data",
+			"plugin_id", pluginID,
+			"external_id", req.ExternalID,
+			"error", fetchErr)
+		if strings.Contains(fetchErr.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "item not found in external source")
+			return
+		}
 		writeError(w, http.StatusBadGateway, "failed to fetch data from external source")
 		return
 	}
 
 	// Validate import data
-	if importData.Name == "" {
+	if fetched.Name == "" {
 		writeError(w, http.StatusBadGateway, "external source returned invalid data (missing name)")
 		return
 	}
 
-	// Ensure category exists for this plugin
-	var cat *domain.Category
-	if features.Categories {
-		cat, _, err = h.ensurePluginCategory(r.Context(), p)
-		if err != nil {
-			slog.Error("failed to ensure plugin category",
-				"plugin_id", pluginID,
-				"error", err)
-			writeError(w, http.StatusInternalServerError, "failed to initialize plugin category")
+	h.publishImport(w, r, p, req.ExternalID, fetched, features)
+}
+
+// publishImport runs the recoverable publication and maps its outcome to HTTP.
+func (h *PluginHandler) publishImport(w http.ResponseWriter, r *http.Request, p domain.ImportPlugin, externalID string, fetched *domain.ImportData, features *domain.OrganizationFeatures) {
+	result, err := h.publisher.publish(r.Context(), p, externalID, fetched, features)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrImportSuperseded):
+			writeError(w, http.StatusConflict, "a newer import of this item superseded this request")
+			return
+		case errors.Is(err, ErrImportBusy):
+			writeError(w, http.StatusServiceUnavailable, "an import for this item is already finishing; please retry")
+			return
+		case errors.Is(err, ErrImportNeedsFetch):
+			writeError(w, http.StatusBadGateway, "failed to fetch data from external source")
 			return
 		}
-	}
-
-	// Convert attributes to JSON
-	importAttributes := map[string]any{}
-	if features.Attributes {
-		importAttributes = namespacedPluginAttributes(pluginID, importData.Attributes)
-	}
-	attrsJSON, err := json.Marshal(importAttributes)
-	if err != nil {
-		slog.Error("failed to marshal import attributes",
-			"plugin_id", pluginID,
-			"error", err)
-		writeError(w, http.StatusInternalServerError, "failed to process import data")
-		return
-	}
-
-	// Create the asset
-	asset := &domain.Asset{
-		OrganizationID:   h.orgID,
-		Name:             importData.Name,
-		Description:      importData.Description,
-		Quantity:         1,
-		Attributes:       attrsJSON,
-		ImportPluginID:   &pluginID,
-		ImportExternalID: &importData.ExternalID,
-	}
-	if cat != nil {
-		asset.CategoryID = &cat.ID
-	}
-
-	if err := h.repos.Assets.Create(r.Context(), asset); err != nil {
 		var attributeErr *repository.AttributeError
 		if errors.As(err, &attributeErr) {
 			writeAttributeError(w, err)
 			return
 		}
-		slog.Error("failed to create imported asset",
-			"plugin_id", pluginID,
-			"external_id", req.ExternalID,
-			"error", err)
+		slog.Error("failed to publish imported item",
+			"plugin_id", p.ID(), "external_id", externalID, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to save imported item")
 		return
 	}
 
-	slog.Info("successfully imported item",
-		"plugin_id", pluginID,
-		"external_id", req.ExternalID,
-		"asset_id", asset.ID)
+	slog.Info("completed plugin import",
+		"plugin_id", p.ID(),
+		"external_id", externalID,
+		"asset_id", result.asset.ID,
+		"created", result.created)
 
-	// Download and store image if available
-	if importData.ImageURL != nil && *importData.ImageURL != "" && h.storage != nil {
-		if err := h.downloadAndStoreImage(r.Context(), asset.ID, *importData.ImageURL); err != nil {
-			// Log error but don't fail the import - image is optional
-			slog.Warn("failed to download image for imported asset",
-				"asset_id", asset.ID,
-				"image_url", *importData.ImageURL,
-				"error", err)
-		}
+	status := http.StatusCreated
+	if !result.created {
+		status = http.StatusOK
 	}
+	writeJSON(w, status, ImportResponse{Asset: result.asset})
+}
 
-	// Load full asset with category
-	asset.Category = cat
-
-	writeJSON(w, http.StatusCreated, ImportResponse{Asset: asset})
+// RecoverPendingImports resumes imports interrupted by a restart, using each
+// publication's pinned snapshot and finishing only the missing stages.
+func (h *PluginHandler) RecoverPendingImports(ctx context.Context) {
+	if h.publisher == nil || h.repos == nil || h.repos.Publications == nil {
+		return
+	}
+	features, err := h.organizationFeatures(ctx)
+	if err != nil {
+		slog.Error("failed to read organization features during import recovery", "error", err)
+		return
+	}
+	h.publisher.RecoverPending(ctx, func(pluginID string) domain.ImportPlugin {
+		p, ok := h.registry.Get(pluginID)
+		if !ok {
+			return nil
+		}
+		return p
+	}, features)
 }
 
 // ensurePluginCategory ensures the plugin's category and attributes exist
@@ -486,7 +493,18 @@ func ensurePluginCategory(
 		}
 
 		if err := categories.Create(ctx, cat); err != nil {
-			return nil, false, err
+			if !isUniqueViolation(err) {
+				return nil, false, err
+			}
+			// A concurrent first import won the category race; adopt it.
+			cat, err = categories.GetByPluginID(ctx, organizationID, pluginID)
+			if err != nil {
+				return nil, false, err
+			}
+			if cat == nil {
+				return nil, false, errors.New("plugin category vanished after unique conflict")
+			}
+			created = false
 		}
 	}
 
@@ -537,7 +555,17 @@ func ensurePluginCategory(
 				DataType:       pa.DataType,
 			}
 			if err := attributes.Create(ctx, attr); err != nil {
-				return nil, false, err
+				if !isUniqueViolation(err) {
+					return nil, false, err
+				}
+				// A concurrent first import won the attribute race; adopt it.
+				attr, err = attributes.GetByKey(ctx, organizationID, pa.Key)
+				if err != nil {
+					return nil, false, err
+				}
+				if attr == nil {
+					return nil, false, fmt.Errorf("plugin attribute %s vanished after unique conflict", pa.Key)
+				}
 			}
 		}
 
@@ -568,103 +596,10 @@ func strPtr(s string) *string {
 	return &s
 }
 
-// downloadAndStoreImage downloads an image from URL and stores it as an attachment
-func (h *PluginHandler) downloadAndStoreImage(ctx context.Context, assetID uuid.UUID, imageURL string) error {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	// Download the image
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("downloading image: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("image download returned status %d", resp.StatusCode)
-	}
-
-	// Limit download size to 10MB
-	limitedReader := io.LimitReader(resp.Body, 10*1024*1024)
-	imageData, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return fmt.Errorf("reading image data: %w", err)
-	}
-
-	// Detect content type
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" || !strings.HasPrefix(contentType, "image/") {
-		contentType = http.DetectContentType(imageData)
-	}
-
-	// Only accept image content types
-	if !strings.HasPrefix(contentType, "image/") {
-		return fmt.Errorf("invalid content type: %s", contentType)
-	}
-
-	// Generate filename from URL or use default
-	filename := "cover"
-	if urlPath := path.Base(imageURL); urlPath != "" && urlPath != "/" {
-		// Remove query string
-		if idx := strings.Index(urlPath, "?"); idx > 0 {
-			urlPath = urlPath[:idx]
-		}
-		if urlPath != "" {
-			filename = urlPath
-		}
-	}
-
-	// Add extension based on content type if missing
-	ext := ""
-	switch contentType {
-	case "image/jpeg":
-		ext = ".jpg"
-	case "image/png":
-		ext = ".png"
-	case "image/gif":
-		ext = ".gif"
-	case "image/webp":
-		ext = ".webp"
-	}
-	if ext != "" && !strings.Contains(filename, ".") {
-		filename += ext
-	}
-
-	// Upload to storage
-	key, err := h.storage.Upload(ctx, filename, contentType, bytes.NewReader(imageData))
-	if err != nil {
-		return fmt.Errorf("uploading to storage: %w", err)
-	}
-
-	// Create attachment record
-	description := "Imported cover image"
-	attachment := &domain.Attachment{
-		AssetID:     assetID,
-		FileKey:     key,
-		FileName:    filename,
-		FileSize:    int64(len(imageData)),
-		ContentType: &contentType,
-		Description: &description,
-	}
-
-	if err := h.repos.Attachments.Create(ctx, attachment); err != nil {
-		// Try to clean up uploaded file
-		h.storage.Delete(ctx, key)
-		return fmt.Errorf("creating attachment record: %w", err)
-	}
-
-	slog.Info("downloaded and stored import image",
-		"asset_id", assetID,
-		"attachment_id", attachment.ID,
-		"filename", filename,
-		"size", len(imageData))
-
-	return nil
+// isUniqueViolation reports whether err is a PostgreSQL unique constraint
+// failure, used to turn concurrent first-time category/attribute creation into
+// an idempotent read.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

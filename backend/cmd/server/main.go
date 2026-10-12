@@ -131,6 +131,7 @@ func main() {
 		Attributes:    repository.NewAttributeRepository(db.Pool),
 		SavedFilters:  repository.NewSavedFilterRepository(db.Pool),
 		Tags:          repository.NewTagRepository(db.Pool),
+		Publications:  repository.NewImportPublicationRepository(db.Pool),
 	}
 
 	// Resolve default organization from database
@@ -223,6 +224,9 @@ func main() {
 	if err := pluginHandler.InitializeEnabledPluginCategories(ctx); err != nil {
 		slog.Warn("one or more plugin categories could not be initialized", "error", err)
 	}
+	// Resume interrupted plugin imports (and clean orphaned cover objects)
+	// without blocking server startup.
+	go pluginHandler.RecoverPendingImports(context.Background())
 	authHandler := handler.NewAuthHandler(userRepo, sessionManager, cfg.PasswordMinLength, cfg.OIDCEnabled, cfg.OIDCAutoRedirect, cfg.AuthDisabled, authDisabledUser)
 	if oauthHandler != nil {
 		authHandler.SetOAuthHandler(oauthHandler)
